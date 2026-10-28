@@ -34,6 +34,7 @@ from odata_cache.filter_dsl import (
     FilterSyntaxError,
     InList,
     IsNull,
+    Literal,
     Logic,
     Node,
     Not,
@@ -148,11 +149,39 @@ def _parse_datetime(text: str) -> date | datetime | None:
 
 
 def coerce(value, vt: str, *, op: str, field: str, pos: int | None):
-    """Привести литерал к типу поля; при неудаче — FilterCompileError."""
+    """Привести литерал к типу поля; при неудаче — FilterCompileError.
+
+    ``value`` может быть ``Literal`` (префиксный тип из $filter: guid'...' и
+    т.п.) — тогда объявленный тип проверяется строго независимо от типа поля.
+    Для строковых полей с like-операторами приведение типов не делается вовсе
+    (число/дата сравниваются как текст).
+    """
     if value is None:
         return None
+    hint = None
+    if isinstance(value, Literal):
+        hint, value = value.type_hint, value.value
+    like_ops = ("contains", "startswith", "endswith")
+    if hint == "guid":
+        g = normalize_guid(str(value))
+        if g is None:
+            raise FilterCompileError(f"не GUID '{value}' (литерал guid)", pos)
+        return g
+    if hint in ("date", "datetime"):
+        dt = _parse_datetime(str(value))
+        if dt is None:
+            raise FilterCompileError(
+                f"не дата '{value}' (формат YYYY-MM-DD[THH:MM:SS])", pos)
+        if hint == "date":
+            return dt if isinstance(dt, date) and not isinstance(dt, datetime) \
+                else dt.date()
+        if isinstance(dt, date) and not isinstance(dt, datetime):
+            return datetime(dt.year, dt.month, dt.day)
+        return dt
     match vt:
         case "int" | "float" | "decimal":
+            if op in like_ops:      # подстрока ищется по текстовому виду
+                return str(value)
             if isinstance(value, bool):
                 raise FilterCompileError(
                     f"поле '{field}' числовое, ожидается число", pos)
@@ -164,6 +193,8 @@ def coerce(value, vt: str, *, op: str, field: str, pos: int | None):
                     f"не число '{value}' для поля '{field}' ({vt})", pos)
             return num
         case "bool":
+            if op in like_ops:
+                return str(value)
             if isinstance(value, bool):
                 return value
             s = str(value).strip().lower()
@@ -180,6 +211,8 @@ def coerce(value, vt: str, *, op: str, field: str, pos: int | None):
                     f"не GUID '{value}' для поля '{field}'", pos)
             return g
         case "date" | "datetime":
+            if op in like_ops:
+                return str(value)
             dt = _parse_datetime(str(value))
             if dt is None:
                 raise FilterCompileError(
@@ -213,27 +246,45 @@ def _escape_like(s: str) -> str:
              .replace("_", _LIKE_ESCAPE + "_"))
 
 
-def _like_ci(column, needle: str, ci: bool | None = None) -> BinaryExpression:
-    """Регистронезависимый поиск подстроки.
-
-    needle — СЫРОЙ текст значения (без % по краям); экранирование LIKE-спец-
-    символов делаем здесь.
-    ci=False → обычный LIKE (коллация БД решает);
-    ci=True/None → [aA]-классы для всех букв (ASCII и кириллица) — одинаково
-    работают в SQLite и PostgreSQL. Индексы не используются, но поиск подстроки
-    их и так не использует; для кэша 1С это приемлемо.
-    """
-    if ci is False:
-        return _like_expr(column, f"%{_escape_like(needle)}%")
-    out = ["%"]
+def _ci_pattern(needle: str) -> str:
+    """Шаблон LIKE без учёта регистра для PostgreSQL: [aA]-классы для всех букв
+    (ASCII и кириллица). Спецсимволы экранируются. Классы не зависят от
+    collation/ICU, поэтому работают детерминированно в любой БД-локали."""
+    out = []
     for ch in needle:
         if ch in (_LIKE_ESCAPE, "%", "_"):     # спецсимвол — экранируем как есть
             out.append(_LIKE_ESCAPE + ch)
             continue
         low, up = ch.lower(), ch.upper()
         out.append(f"[{low}{up}]" if low != up else ch)
-    out.append("%")
-    return _like_expr(column, "".join(out))
+    return "".join(out)
+
+
+def _like_ci(column, pattern: str, ci: bool | None = None) -> BinaryExpression:
+    """Сопоставление с ГОТОВЫМ шаблоном LIKE без учёта регистра.
+
+    pattern может содержать % и _ (метасимволы сохраняются как есть): шаблон
+    собрали компилятор (contains/startswith/endswith) или пользователь
+    («~ '%слово%'» / like с wildcards).
+    ci=False → обычный LIKE (коллация БД решает).
+
+    Реализация выбирается по диалекту соединения (column.table.metadata.bind):
+      * SQLite — u_lower(col) LIKE u_lower(pattern): встроенные lower/LIKE в
+        SQLite знают только ASCII, поэтому на connect регистрируется
+        Python-функция u_lower (см. db/engine.py);
+      * остальные (PostgreSQL) — [aA]-классы, не зависят от collation.
+    Индексы не используются, но поиск подстроки их и так не использует;
+    для кэша 1С это приемлемо.
+    """
+    if ci is False:
+        return _like_expr(column, pattern)
+    md = getattr(getattr(column, "table", None), "metadata", None)
+    bind = getattr(md, "bind", None)
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", None)
+    if dialect_name == "sqlite":
+        ul = func.u_lower
+        return ul(column).like(ul(pattern), escape=_LIKE_ESCAPE)
+    return _like_expr(column, _ci_pattern(pattern))
 
 
 def compile_node(node: Node, fields: dict[str, FieldInfo]):
@@ -258,7 +309,15 @@ def compile_node(node: Node, fields: dict[str, FieldInfo]):
                 case "le":
                     return col <= val
                 case "contains":
-                    return _like_ci(col, f"%{_escape_like(str(val))}%", ci=fi.ci)
+                    # «~» / like / contains: если пользователь сам задал шаблон
+                    # с % — используем его как есть (экранируем только буквы под ci);
+                    # иначе — ищем подстроку.
+                    raw = str(val)
+                    if "%" in raw or "_" in raw:
+                        pattern = raw
+                    else:
+                        pattern = f"%{_escape_like(raw)}%"
+                    return _like_ci(col, pattern, ci=fi.ci)
                 case "startswith":
                     return _like_ci(col, f"{_escape_like(str(val))}%", ci=fi.ci)
                 case "endswith":

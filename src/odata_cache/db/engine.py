@@ -53,6 +53,12 @@ def _build_engine(settings: Settings) -> Engine:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA foreign_keys=ON")
             cur.close()
+            # Unicode-aware lower для LIKE (встроенный lower() в SQLite — только
+            # ASCII; кириллица не приводится). См. filter_compile._like_ci.
+            dbapi_conn.create_function(
+                "u_lower", 1, lambda s: s.lower() if isinstance(s, str) else s,
+                deterministic=True,
+            )
 
     return engine
 
