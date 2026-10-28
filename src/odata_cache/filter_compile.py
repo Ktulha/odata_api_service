@@ -265,27 +265,27 @@ def _dialect_of(column) -> str | None:
     """Имя диалекта соединения, привязанного к колонке/таблице.
 
     Порядок поиска (SQLAlchemy 2.x):
-      1. ``column.table.metadata._engine`` — «привязка» через Table.create/
-         MetaData.attach (используется в тестах и при bootstrap-схемах);
-      2. унаследованный bind через ``_bind__role_name__`` (deprecated, но
-         встречается в ORM-классах);
-      3. глобальный engine процесса из ``db.engine.get_engine()`` — основной
-         путь для production (все таблицы создаются одним движком).
+      1. ``column.table.metadata.bind`` — MetaData, загружавшая таблицу через
+         ``autoload_with=engine`` (основной путь для query_service);
+      2. ``column.table.metadata._engine`` — «привязка» через Table.create;
+      3. глобальный engine процесса из ``db.engine.get_engine()`` — production-
+         путь для ORM-таблиц, созданных общим движком.
     Если ни один источник не найден — возвращаем None (fallback на [aA]-классы,
     безопасно и для PostgreSQL, и для SQLite с ASCII-данными).
     """
     table = getattr(column, "table", None)
     md = getattr(table, "metadata", None) if table is not None else None
-    eng = getattr(md, "_engine", None) if md is not None else None
-    if eng is not None:
-        return getattr(getattr(eng, "dialect", None), "name", None)
-    # Глобальный engine процесса (ленивый импорт — чтобы компилятор можно было
-    # использовать без БД, например в чистых unit-тестах AST).
-    try:
-        from odata_cache.db import engine as _db_engine
-        eng = _db_engine._engine
-    except Exception:  # pragma: no cover - защита от циклических импортов
-        eng = None
+    eng = getattr(md, "bind", None) if md is not None else None
+    if eng is None and md is not None:
+        eng = getattr(md, "_engine", None)
+    if eng is None:
+        # Глобальный engine процесса (ленивый импорт — чтобы компилятор можно было
+        # использовать без БД, например в чистых unit-тестах AST).
+        try:
+            from odata_cache.db import engine as _db_engine
+            eng = _db_engine._engine
+        except Exception:  # pragma: no cover - защита от циклических импортов
+            eng = None
     if eng is not None:
         return getattr(getattr(eng, "dialect", None), "name", None)
     return None

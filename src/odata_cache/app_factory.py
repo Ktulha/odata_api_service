@@ -25,8 +25,12 @@ def create_app(mode: str = "all", settings: Settings | None = None) -> Flask:
 
     register_health(app)
 
-    # Blueprints data/admin подключим на шагах 5, 6 и 10:
-    # from odata_cache.api.data import bp as data_bp
+    if mode in ("api", "all"):
+        from odata_cache.api.data import bp as data_bp
+
+        app.register_blueprint(data_bp)
+
+    # Blueprint admin подключим на шаге 11:
     # from odata_cache.api.admin import bp as admin_bp
     return app
 

@@ -46,6 +46,7 @@ def _build_engine(settings: Settings) -> Engine:
     engine = create_engine(url, **kwargs)
 
     if url.startswith("sqlite"):
+        register_ci_functions(engine)
 
         @event.listens_for(engine, "connect")
         def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - обёртка
@@ -53,14 +54,29 @@ def _build_engine(settings: Settings) -> Engine:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA foreign_keys=ON")
             cur.close()
-            # Unicode-aware lower для LIKE (встроенный lower() в SQLite — только
-            # ASCII; кириллица не приводится). См. filter_compile._like_ci.
-            dbapi_conn.create_function(
-                "u_lower", 1, lambda s: s.lower() if isinstance(s, str) else s,
-                deterministic=True,
-            )
 
     return engine
+
+
+def register_ci_functions(engine: Engine) -> None:
+    """Регистрирует unicode-aware lower() для SQLite-соединений engine.
+
+    Встроенный lower()/LIKE в SQLite знают только ASCII; кириллица не
+    приводится к регистру. Функция ``u_lower`` используется компилятором
+    фильтров (см. filter_compile._like_ci) для регистронезависимого поиска.
+    Идемпотентно: повторные вызовы на одном engine не плодят слушателей.
+    """
+    if getattr(engine, "_odata_ci_registered", False):
+        return
+
+    @event.listens_for(engine, "connect")
+    def _register_u_lower(dbapi_conn, _record):
+        dbapi_conn.create_function(
+            "u_lower", 1, lambda s: s.lower() if isinstance(s, str) else s,
+            deterministic=True,
+        )
+
+    engine._odata_ci_registered = True
 
 
 def get_engine(settings: Settings | None = None) -> Engine:
