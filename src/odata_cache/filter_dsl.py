@@ -49,10 +49,18 @@ KEYWORD_OPS = {"eq", "ne", "gt", "ge", "lt", "le"}
 # словесные синонимы операторов (like — из эскиза пользователя, = contains)
 KEYWORD_OP_ALIASES = {"like": "contains_sugar"}
 FUNCTIONS = {"contains", "startswith", "endswith"}
+# служебные префиксы типизированных литералов — не имена полей
+TYPE_PREFIXES = {"guid", "datetime", "date", "duration", "time"}
 # зарезервированные слова: операторы/логика/литералы — не могут быть именами полей
-RESERVED_WORDS = KEYWORD_OPS | set(KEYWORD_OP_ALIASES) | {
+RESERVED_WORDS = KEYWORD_OPS | set(KEYWORD_OP_ALIASES) | TYPE_PREFIXES | {
     "and", "or", "not", "in", "is", "true", "false", "null",
 }
+
+
+def _looks_like_guid(text: str) -> bool:
+    return re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", text) is not None
 
 
 def strip_filter_prefix(source: str) -> str:
@@ -73,6 +81,8 @@ _TOKEN_RE = re.compile(
   | (?P<tstring>(?:guid|datetime|date)\s*'[^']*')   # типизированный литерал
   | (?P<guidlit>guid\s*\((?:'[^']*'|"[^"]*"|[A-Za-z0-9_-]+)\))  # канон OData v3: guid(...)
   | (?P<string>'(?:[^']|'')*')                      # обычная строка
+  | (?P<guid>[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})
+                                                    # GUID без кавычек (эскиз: in [guid,guid])
   | (?P<unq>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*(?:-[A-Za-zА-Яа-яЁё_0-9]+)+)
                                                     # некавыцированное имя поля с дефисом
   | (?P<number>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
@@ -125,12 +135,19 @@ def tokenize(source: str, end_pos: int | None = None) -> list[Token]:
         elif kind == "guidlit":
             inner = text[text.index("(") + 1:-1].strip().strip("'\"")
             tokens.append(Token("string", inner, pos, literal="guid"))
+        elif kind == "guid":
+            tokens.append(Token("string", text, pos, literal="guid"))
         elif kind == "string":
             tokens.append(Token("string", text[1:-1].replace("''", "'"), pos))
         elif kind == "number":
             tokens.append(Token("number", text, pos))
         elif kind == "unq":
-            tokens.append(Token("ident", text, pos))
+            # «число-с-дефисами» на самом деле GUID без кавычек
+            # (эскиз пользователя: in [e912e33c-d7a5-...]) → строковый литерал
+            if _looks_like_guid(text):
+                tokens.append(Token("string", text, pos, literal="guid"))
+            else:
+                tokens.append(Token("ident", text, pos))
         elif kind == "word":
             low = text.lower()
             if low in RESERVED_WORDS:
@@ -154,18 +171,30 @@ class Node:
 
 
 @dataclass
+class Literal:
+    """Строковый литерал с префиксом типа (guid'...' / datetime'...' / date'...').
+
+    Значение храним как строку, но помним объявленный тип — компилятор
+    использует его для строгой проверки (например, guid-литерал обязан быть
+    валидным GUID независимо от типа поля).
+    """
+    value: str
+    type_hint: str  # 'guid' | 'datetime' | 'date'
+
+
+@dataclass
 class Compare(Node):
     """Поле <оп> значение. op: eq ne gt ge lt le contains startswith endswith."""
     field_name: str
     op: str
-    value: Any  # str | int | float | bool | None
+    value: Any  # str | int | float | bool | None | Literal
     pos: int = 0
 
 
 @dataclass
 class InList(Node):
     field_name: str
-    items: list[Any]
+    items: list[Any]  # значения как в Compare.value
     negated: bool = False
     pos: int = 0
 
@@ -390,7 +419,7 @@ class Parser:
     def parse_literal_value(self) -> Any:
         t = self.next()
         if t.kind == "string":
-            return t.value
+            return Literal(t.value, t.literal) if t.literal else t.value
         if t.kind == "number":
             return int(t.value) if re.fullmatch(r"[+-]?\d+", t.value) \
                 else float(t.value)
