@@ -72,6 +72,7 @@ class FieldInfo:
     value_type: str      # string|guid|int|float|decimal|bool|date|datetime
     exposed: bool = True
     column_obj: object | None = None  # SQLAlchemy Column (заполняет make_field_infos)
+    ci: bool | None = None            # принудительная регистронезависимость; None → авто по диалекту
 
 
 def field_info_from_property(prop) -> FieldInfo:
@@ -98,7 +99,10 @@ def build_field_index(props: list) -> dict[str, FieldInfo]:
 # Приведение литералов по типу поля
 # ---------------------------------------------------------------------------
 
-_GUID_RE = re.compile(r"^[\(\{\[]?guid['\"]?\s*\((.*)\)['\"]?[\)\}\]]?$", re.I)
+_GUID_RE = re.compile(
+    r"""^[\(\{\[]?guid['"]?\s*\(?(.*?)\)?['"]?[\)\}\]]?$""",
+    re.I | re.S,
+)
 _DATE_FULL_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})([T ]\d{2}:\d{2}(:\d{2})?)?")
 
 
@@ -209,17 +213,27 @@ def _escape_like(s: str) -> str:
              .replace("_", _LIKE_ESCAPE + "_"))
 
 
-def _ci_pattern(pattern: str) -> str:
-    """Регистронезависимый LIKE без lower() на колонке — иначе индекс не
-    используется. ASCII-часть паттерна разворачиваем в [Aa]-классы, кириллица
-    в SQLite и PostgreSQL сопоставляется LIKE как есть (NOCASE/ICU/collation)."""
-    out = []
-    for ch in pattern:
-        if "a" <= ch.lower() <= "z":
-            out.append(f"[{ch.lower()}{ch.upper()}]")
-        else:
-            out.append(ch)
-    return "".join(out)
+def _like_ci(column, needle: str, ci: bool | None = None) -> BinaryExpression:
+    """Регистронезависимый поиск подстроки.
+
+    needle — СЫРОЙ текст значения (без % по краям); экранирование LIKE-спец-
+    символов делаем здесь.
+    ci=False → обычный LIKE (коллация БД решает);
+    ci=True/None → [aA]-классы для всех букв (ASCII и кириллица) — одинаково
+    работают в SQLite и PostgreSQL. Индексы не используются, но поиск подстроки
+    их и так не использует; для кэша 1С это приемлемо.
+    """
+    if ci is False:
+        return _like_expr(column, f"%{_escape_like(needle)}%")
+    out = ["%"]
+    for ch in needle:
+        if ch in (_LIKE_ESCAPE, "%", "_"):     # спецсимвол — экранируем как есть
+            out.append(_LIKE_ESCAPE + ch)
+            continue
+        low, up = ch.lower(), ch.upper()
+        out.append(f"[{low}{up}]" if low != up else ch)
+    out.append("%")
+    return _like_expr(column, "".join(out))
 
 
 def compile_node(node: Node, fields: dict[str, FieldInfo]):
@@ -244,11 +258,11 @@ def compile_node(node: Node, fields: dict[str, FieldInfo]):
                 case "le":
                     return col <= val
                 case "contains":
-                    return _like_expr(col, _ci_pattern(f"%{_escape_like(str(val))}%"))
+                    return _like_ci(col, f"%{_escape_like(str(val))}%", ci=fi.ci)
                 case "startswith":
-                    return _like_expr(col, _ci_pattern(f"{_escape_like(str(val))}%"))
+                    return _like_ci(col, f"{_escape_like(str(val))}%", ci=fi.ci)
                 case "endswith":
-                    return _like_expr(col, _ci_pattern(f"%{_escape_like(str(val))}"))
+                    return _like_ci(col, f"%{_escape_like(str(val))}", ci=fi.ci)
                 case _:
                     raise FilterCompileError(f"оператор '{node.op}' не поддерживается", node.pos)
 
