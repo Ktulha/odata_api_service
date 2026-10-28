@@ -118,3 +118,30 @@ class RequestLog(Base):
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     client_ip: Mapped[str | None] = mapped_column(String(64))
+
+
+class LazyLoadRequest(Base):
+    """Очередь ленивой загрузки: заявка API → исполнитель worker (шаг C.5).
+
+    Когда клиент впервые обращается к разрешённой, но ещё ни разу не
+    синхронизированной сущности, api-процесс НЕ ходит в 1С сам — он ставит
+    сюда pending-заявку и отвечает пустым набором с warning'ом. Worker
+    (отдельный процесс или in-process планировщик в режиме 'all') подбирает
+    заявки своим циклом и выполняет sync_entity(trigger='startup').
+    Дедупликация на стороне api: одна pending/running-заявка на сущность.
+    """
+
+    __tablename__ = "lazy_load_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    # pending → running → done | failed
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    claimed_at: Mapped[str | None] = mapped_column(Text)
+    finished_at: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+
+    entity: Mapped["Entity"] = relationship()  # noqa: F821
