@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     # --- worker / планировщик ---
     sync_default_cron: str = "*/15 * * * *"  # расписание по умолчанию для новых сущностей
     scheduler_enabled: bool = True           # выключать на роли api и в тестах
+    lazy_load_enabled: bool = True           # ленивая докачка при первом обращении к API
+    lazy_poll_sec: int = 5                   # как часто worker подбирает очередь lazy_load_requests
 
     # --- pagination (data API) ---
     default_page_size: int = 50

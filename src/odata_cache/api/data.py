@@ -158,4 +158,66 @@ def get_data(entity_name: str):
                       f"Сущность '{entity_name}' недоступна")
     except QueryError as e:
         return _error(400, "bad_query", e.message, e.detail)
+
+    # ленивая загрузка (ТЗ 3.1 lazy + согласование «при первом обращении»):
+    # если таблица ещё ни разу не наполнялась — ставим фоновую докачку из 1С
+    # и отдаём пустой ответ с предупреждением; следующий запрос увидит данные.
+    if _maybe_lazy_load(entity_name):
+        meta = result.setdefault("meta", {})
+        warns = meta.setdefault("warnings", [])
+        if isinstance(warns, list):
+            warns.append(
+                "Данные загружаются из 1С в фоне — повторите запрос через несколько секунд."
+            )
     return jsonify(result)
+
+
+def _maybe_lazy_load(entity_name: str) -> bool:
+    """Поставить on-demand задачу синхронизации, если кеш пуст.
+
+    Роль api может НЕ иметь реквизитов 1С — тогда worker живёт в отдельном
+    процессе и подбирает очередь из таблицы ``lazy_load_requests``.
+    Возвращает True, если задача поставлена/уже идёт (ответ annotate warning'ом).
+    """
+    from odata_cache.config import get_settings
+
+    if not getattr(get_settings(), "lazy_load_enabled", True):
+        return False
+    if current_app.config.get("LAZY_LOAD_DISABLED"):  # тесты выключают явно
+        return False
+
+    session = _session()
+    ent = access.get_entity(session, entity_name)
+    if ent is None or not access.needs_initial_load(ent):
+        return False
+
+    # in-process вариант (режим 'all'): планировщик приложён к app.config
+    sched = current_app.config.get("SCHEDULER")
+    if sched is not None:
+        try:
+            sched.trigger_now(ent.name)
+            return True
+        except Exception:  # noqa: BLE001 — планировщик мог ещё не стартовать
+            logger.exception("lazy trigger_now упал")
+
+    # межпроцессная очередь: одна pending-заявка на сущность
+    from sqlalchemy import select
+
+    from odata_cache.models.sync import LazyLoadRequest
+
+    existing = session.scalar(
+        select(LazyLoadRequest).where(
+            LazyLoadRequest.entity_id == ent.id,
+            LazyLoadRequest.status.in_(("pending", "running")),
+        )
+    )
+    if existing is not None:
+        return True  # уже в очереди
+    try:
+        session.add(LazyLoadRequest(entity_id=ent.id))
+        session.commit()
+        return True
+    except Exception:  # noqa: BLE001
+        session.rollback()
+        logger.exception("постановка lazy-заявки не удалась")
+        return False
