@@ -46,11 +46,26 @@ OP_SYMBOLS = {
 }
 
 KEYWORD_OPS = {"eq", "ne", "gt", "ge", "lt", "le"}
+# словесные синонимы операторов (like — из эскиза пользователя, = contains)
+KEYWORD_OP_ALIASES = {"like": "contains_sugar"}
 FUNCTIONS = {"contains", "startswith", "endswith"}
 # зарезервированные слова: операторы/логика/литералы — не могут быть именами полей
-RESERVED_WORDS = KEYWORD_OPS | {
+RESERVED_WORDS = KEYWORD_OPS | set(KEYWORD_OP_ALIASES) | {
     "and", "or", "not", "in", "is", "true", "false", "null",
 }
+
+
+def strip_filter_prefix(source: str) -> str:
+    """Срезает ``$filter`` и обрамляющие ``{}`` — эскиз пользователя допускает
+    передачу строки целиком: ``$filter{Description like 'халат'}``.
+    """
+    s = source.strip()
+    if s.lower().startswith("$filter"):
+        s = s[len("$filter"):]
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1]
+    return s
 
 _TOKEN_RE = re.compile(
     r"""
@@ -59,8 +74,8 @@ _TOKEN_RE = re.compile(
   | (?P<string>'(?:[^']|'')*')                      # обычная строка
   | (?P<number>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
   | (?P<op><>|!=|>=|<=|[=<>~])
-  | (?P<lparen>[\({])
-  | (?P<rparen>[\)}])
+  | (?P<lparen>[\(\[\{])
+  | (?P<rparen>[\)\]\}])
   | (?P<comma>,)
   | (?P<word>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)
     """,
@@ -204,6 +219,21 @@ class Parser:
             raise FilterSyntaxError("ожидалось имя поля", tok.pos)
         return tok
 
+    # --- скобки: () [] {} взаимозаменяемы, но парные ---
+    _CLOSE_FOR = {r"(": r")", r"[": r"]", r"{": r"}"}
+
+    def eat_open(self, what: str = "открывающая скобка") -> str:
+        tok = self.next()
+        if tok.kind != "lparen" or tok.value not in self._CLOSE_FOR:
+            raise FilterSyntaxError(f"ожидалась {what}", tok.pos)
+        return tok.value
+
+    def eat_close(self, opener: str) -> None:
+        tok = self.next()
+        if tok.kind != "rparen" or tok.value != self._CLOSE_FOR[opener]:
+            raise FilterSyntaxError(
+                f"ожидалась '{self._CLOSE_FOR[opener]}'", tok.pos)
+
     # --- грамма ---
     def parse(self) -> Node:
         if self.peek() is None:
@@ -227,8 +257,20 @@ class Parser:
 
     def parse_and(self) -> Node:
         left = self.parse_unary()
-        while (t := self.peek()) and t.kind == "kw" and t.value == "and":
-            self.next()
+        while True:
+            t = self.peek()
+            if t is None:
+                break
+            join_and = False
+            if t.kind == "kw" and t.value == "and":
+                join_and = True
+                self.next()
+            elif t.kind == "comma":
+                # запятая между предикатами == and (эскиз: in [...], Desc like '...')
+                join_and = True
+                self.next()
+            if not join_and:
+                break
             right = self.parse_unary()
             if isinstance(left, Logic) and left.op == "and":
                 left.children.append(right)
@@ -250,11 +292,9 @@ class Parser:
                                     self.tokens[-1].pos if self.tokens else 0)
         if t.kind in ("lparen",):
             self._enter(t.pos)
-            self.next()
+            opener = self.next().value
             node = self.parse_or()
-            close = self.next()
-            if close.kind != "rparen":
-                raise FilterSyntaxError("ожидалась закрывающая скобка", close.pos)
+            self.eat_close(opener)
             self.depth -= 1
             return node
         if t.kind == "ident" and t.value.lower() in FUNCTIONS:
@@ -264,17 +304,13 @@ class Parser:
     def parse_function(self) -> Node:
         name_tok = self.next()
         fn = name_tok.value.lower()
-        open_tok = self.next()
-        if open_tok.kind != "lparen":
-            raise FilterSyntaxError(f"после {fn}( ожидался аргумент", open_tok.pos)
+        opener = self.eat_open(f"открывающая скобка после {fn}(")
         field_tok = self.expect_field()
         comma = self.next()
         if comma.kind != "comma":
             raise FilterSyntaxError("ожидалась запятая", comma.pos)
         value = self.parse_literal_value()
-        close = self.next()
-        if close.kind != "rparen":
-            raise FilterSyntaxError("ожидалась ')'", close.pos)
+        self.eat_close(opener)
         return Compare(field_tok.value, fn, value, pos=name_tok.pos)
 
     def parse_comparison(self) -> Node:
@@ -306,12 +342,14 @@ class Parser:
                 raise FilterSyntaxError("ожидалось 'null'", null_tok.pos)
             return IsNull(fname, negated=negated, pos=t.pos)
 
-        # оператор сравнения: символьный (= ~ > ...) или словесный (eq ne gt ge lt le)
+        # оператор сравнения: символьный (= ~ > ...) или словесный (eq ne gt ge lt le like)
         op = None
         if t.kind == "op":
             op = t.value
         elif t.kind == "kw" and t.value in KEYWORD_OPS:
             op = t.value
+        elif t.kind == "kw" and t.value in KEYWORD_OP_ALIASES:
+            op = KEYWORD_OP_ALIASES[t.value]
         if op is not None:
             if op == "contains_sugar":
                 op = "contains"
@@ -325,12 +363,10 @@ class Parser:
             t.pos)
 
     def parse_in_list(self, fname: str, *, negated: bool, pos: int) -> Node:
-        open_tok = self.next()
-        if open_tok.kind != "lparen":
-            raise FilterSyntaxError("после 'in' ожидался список в () или {}",
-                                    open_tok.pos)
+        opener = self.eat_open("список в () / [] / {}")
         items: list[Any] = []
-        if (nxt := self.peek()) and nxt.kind == "rparen":
+        if (nxt := self.peek()) and nxt.kind == "rparen" \
+                and nxt.value == self._CLOSE_FOR[opener]:
             self.next()
             return InList(fname, items, negated=negated, pos=pos)
         while True:
@@ -338,7 +374,7 @@ class Parser:
             sep = self.next()
             if sep.kind == "comma":
                 continue
-            if sep.kind == "rparen":
+            if sep.kind == "rparen" and sep.value == self._CLOSE_FOR[opener]:
                 break
             raise FilterSyntaxError("ожидалась ',' или закрывающая скобка", sep.pos)
         return InList(fname, items, negated=negated, pos=pos)
@@ -364,8 +400,9 @@ class Parser:
 
 
 def parse_filter(source: str) -> Node:
-    """Строка $filter → AST. Бросает FilterSyntaxError с позицией."""
-    return Parser(tokenize(source)).parse()
+    """Строка $filter → AST. Допускается префикс ``$filter`` и обрамляющие ``{}``
+    (эскиз пользователя). Бросает FilterSyntaxError с позицией."""
+    return Parser(tokenize(strip_filter_prefix(source))).parse()
 
 
 # ---------------------------------------------------------------------------
