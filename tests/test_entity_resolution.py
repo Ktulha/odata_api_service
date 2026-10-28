@@ -67,8 +67,17 @@ def test_direct_target_without_alias(session):
     assert session.get(Entity, r.effective_id).name == "Catalog_ЕдиницыИзмерения"
 
 
+def _activate(session, *names):
+    """Включить сущности глобально (админ-действие) — иначе alias не применяется:
+    правило ТЗ «запрещено → не грузим» сильнее настройки подмены."""
+    for n in names:
+        access.get_entity(session, n).is_active = True
+
+
 def test_global_alias_redirects(session):
     """Глобальная прокладка: ЕдиницыИзмерения → КлассификаторЕдиницИзмерения."""
+    _activate(session, "Catalog_Номенклатура", "Catalog_ЕдиницыИзмерения",
+              "Catalog_КлассификаторЕдиницИзмерения")
     entity_resolution.set_alias(
         session,
         source="Catalog_ЕдиницыИзмерения",
@@ -98,23 +107,26 @@ def test_disabled_target_alias_ignored(session):
 
 def test_link_override_beats_alias(session):
     """link_override владельца конкретнее alias-правила."""
+    _activate(session, "Catalog_Номенклатура", "Catalog_ЕдиницыИзмерения",
+              "Catalog_КлассификаторЕдиницИзмерения")
     entity_resolution.set_alias(
         session, source="Catalog_ЕдиницыИзмерения",
         target="Catalog_КлассификаторЕдиницИзмерения",
     )
     nom = access.get_entity(session, "Catalog_Номенклатура")
-    nom.link_override = {"ЕдиницаИзмерения_Key": "Catalog_Номенклатура"}
-    # самоцитирующая подмена бессмысленна — используем другую реальную сущность
-    nom.link_override = {"ЕдиницаИзмерения_Key": "Catalog_ЕдиницыИзмерения"}
+    # подмена ведёт на другую РЕАЛЬНУЮ сущность, отличную от цели по умолчанию
+    nom.link_override = {"ЕдиницаИзмерения_Key": "Catalog_КлассификаторЕдиницИзмерения"}
     session.commit()
     _, prop = _nom_prop(session)
     r = entity_resolution.resolve_ref_target(session, nom, prop, prop.ref_entity_id)
     assert r.rule == "override"
-    assert session.get(Entity, r.effective_id).name == "Catalog_ЕдиницыИзмерения"
+    assert session.get(Entity, r.effective_id).name == "Catalog_КлассификаторЕдиницИзмерения"
 
 
 def test_owner_property_alias_specificity(session):
     """Точечное правило (owner+property) важнее глобальной прокладки."""
+    _activate(session, "Catalog_Номенклатура", "Catalog_ЕдиницыИзмерения",
+              "Catalog_КлассификаторЕдиницИзмерения")
     nom = access.get_entity(session, "Catalog_Номенклатура")
     entity_resolution.set_alias(
         session, source="Catalog_ЕдиницыИзмерения",

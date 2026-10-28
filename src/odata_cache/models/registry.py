@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from odata_cache.db.base import Base
@@ -93,7 +93,10 @@ class Entity(TimestampMixin, Base):
     alias_of_id: Mapped[int | None] = mapped_column(
         ForeignKey("entities.id", ondelete="SET NULL")
     )
-    link_override: Mapped[str | None] = mapped_column(Text)  # JSON: prop_name → entity name
+    # JSON-карта точечных подмен целей ссылок: prop_name → entity name.
+    # JSON-тип (не Text): на PG ложится в jsonb, на SQLite сериализуется сам —
+    # иначе UPDATE со словарём падает («type 'dict' is not supported»).
+    link_override: Mapped[dict | None] = mapped_column(JSON)
 
     # статистика последней успешной синхронизации (для админки/отладки)
     last_synced_at: Mapped[str | None] = mapped_column(Text)
@@ -114,16 +117,23 @@ class Entity(TimestampMixin, Base):
 
     @property
     def link_override_map(self) -> dict[str, str]:
-        """Распарсенная ``link_override`` (пустой словарь, если не задана)."""
+        """Карта ``link_override`` (пустой словарь, если не задана).
+
+        Колонка имеет тип JSON, поэтому на выходе сразу dict; разбор строки
+        оставлен как страховка для данных, записанных до миграции на JSON.
+        """
+        data = self.link_override
+        if isinstance(data, dict):
+            return data
+        if not data:
+            return {}
         import json
 
-        if not self.link_override:
-            return {}
         try:
-            data = json.loads(self.link_override)
+            parsed = json.loads(data)
         except (TypeError, ValueError):
             return {}
-        return data if isinstance(data, dict) else {}
+        return parsed if isinstance(parsed, dict) else {}
 
 
 class EntityAlias(Base):
