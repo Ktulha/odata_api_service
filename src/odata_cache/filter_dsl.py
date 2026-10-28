@@ -170,16 +170,24 @@ class Node:
     pass
 
 
-@dataclass
-class Literal:
+class Literal(str):
     """Строковый литерал с префиксом типа (guid'...' / datetime'...' / date'...').
 
-    Значение храним как строку, но помним объявленный тип — компилятор
-    использует его для строгой проверки (например, guid-литерал обязан быть
-    валидным GUID независимо от типа поля).
+    Наследуемся от ``str``, чтобы значения можно было сравнивать напрямую со
+    строками (удобно в тестах и при отладке), но при этом помнить объявленный
+    тип — компилятор использует его для строгой проверки (например, guid-литерал
+    обязан быть валидным GUID независимо от типа поля).
     """
-    value: str
-    type_hint: str  # 'guid' | 'datetime' | 'date'
+
+    __slots__ = ("type_hint",)
+
+    def __new__(cls, value: str, type_hint: str = "string"):
+        obj = super().__new__(cls, value)
+        obj.type_hint = type_hint
+        return obj
+
+    def __repr__(self) -> str:  # pragma: no cover - для отладки
+        return f"Literal(value={str.__repr__(self)}, type_hint={self.type_hint!r})"
 
 
 @dataclass

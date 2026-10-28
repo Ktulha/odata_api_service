@@ -160,7 +160,8 @@ def coerce(value, vt: str, *, op: str, field: str, pos: int | None):
         return None
     hint = None
     if isinstance(value, Literal):
-        hint, value = value.type_hint, value.value
+        hint = value.type_hint
+        value = str(value)
     like_ops = ("contains", "startswith", "endswith")
     if hint == "guid":
         g = normalize_guid(str(value))
@@ -260,6 +261,36 @@ def _ci_pattern(needle: str) -> str:
     return "".join(out)
 
 
+def _dialect_of(column) -> str | None:
+    """Имя диалекта соединения, привязанного к колонке/таблице.
+
+    Порядок поиска (SQLAlchemy 2.x):
+      1. ``column.table.metadata._engine`` — «привязка» через Table.create/
+         MetaData.attach (используется в тестах и при bootstrap-схемах);
+      2. унаследованный bind через ``_bind__role_name__`` (deprecated, но
+         встречается в ORM-классах);
+      3. глобальный engine процесса из ``db.engine.get_engine()`` — основной
+         путь для production (все таблицы создаются одним движком).
+    Если ни один источник не найден — возвращаем None (fallback на [aA]-классы,
+    безопасно и для PostgreSQL, и для SQLite с ASCII-данными).
+    """
+    table = getattr(column, "table", None)
+    md = getattr(table, "metadata", None) if table is not None else None
+    eng = getattr(md, "_engine", None) if md is not None else None
+    if eng is not None:
+        return getattr(getattr(eng, "dialect", None), "name", None)
+    # Глобальный engine процесса (ленивый импорт — чтобы компилятор можно было
+    # использовать без БД, например в чистых unit-тестах AST).
+    try:
+        from odata_cache.db import engine as _db_engine
+        eng = _db_engine._engine
+    except Exception:  # pragma: no cover - защита от циклических импортов
+        eng = None
+    if eng is not None:
+        return getattr(getattr(eng, "dialect", None), "name", None)
+    return None
+
+
 def _like_ci(column, pattern: str, ci: bool | None = None) -> BinaryExpression:
     """Сопоставление с ГОТОВЫМ шаблоном LIKE без учёта регистра.
 
@@ -268,7 +299,7 @@ def _like_ci(column, pattern: str, ci: bool | None = None) -> BinaryExpression:
     («~ '%слово%'» / like с wildcards).
     ci=False → обычный LIKE (коллация БД решает).
 
-    Реализация выбирается по диалекту соединения (column.table.metadata.bind):
+    Реализация выбирается по диалекту соединения (column.table.db.dialect):
       * SQLite — u_lower(col) LIKE u_lower(pattern): встроенные lower/LIKE в
         SQLite знают только ASCII, поэтому на connect регистрируется
         Python-функция u_lower (см. db/engine.py);
@@ -278,10 +309,7 @@ def _like_ci(column, pattern: str, ci: bool | None = None) -> BinaryExpression:
     """
     if ci is False:
         return _like_expr(column, pattern)
-    md = getattr(getattr(column, "table", None), "metadata", None)
-    bind = getattr(md, "bind", None)
-    dialect_name = getattr(getattr(bind, "dialect", None), "name", None)
-    if dialect_name == "sqlite":
+    if _dialect_of(column) == "sqlite":
         ul = func.u_lower
         return ul(column).like(ul(pattern), escape=_LIKE_ESCAPE)
     return _like_expr(column, _ci_pattern(pattern))
