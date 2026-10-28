@@ -5,7 +5,7 @@ description = "Read-only caching API proxy for 1C OData (Flask + SQLAlchemy)"
 requires-python = ">=3.12"
 dependencies = [
     "flask>=3.0",
-    "sqlalchemy>=2.0",
+    "sqlalchemy==2.0.36",
     "alembic>=1.13",
     "psycopg[binary]>=3.1",
     "pydantic-settings>=2.0",
