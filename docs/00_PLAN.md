@@ -7,17 +7,17 @@
      │  Bearer token                             ▲
      ▼                                           │ только sync-воркер ходит в 1С
 ┌─────────────────────── Роль: app ──────────────────────┐
-│  FastAPI                                             │
-│  ├ AuthMiddleware (проверка bearer при ЛЮБОМ запросе) │
-│  ├ Data API: /api/v1/{entity}  (реестр разрешенных)   │
-│  └ Admin API: /admin/v1/*      (роли, токены, cron…)  │
+│  Flask app factory                                   │
+│  ├ before_request: проверка bearer при ЛЮБОМ запросе │
+│  ├ Blueprint data: /api/v1/entities/<name>/...       │
+│  └ Blueprint admin: /admin/v1/*  (роли, токены, …)   │
 └───────────────┬────────────────────────────────────────┘
                 ▼
-        Собственная БД (PostgreSQL)  ◄── все запросы API только сюда
+     Собственная БД (PostgreSQL / SQLite) ◄── API только сюда
                 ▲
 ┌────────── Отдельная роль: worker ──────────┐
-│  Синхронизатор: scheduler (APScheduler)    │
-│  + OData-клиент к 1С, upsert в БД          │
+│  Синхронизатор: APScheduler                │
+│  + OData-клиент к 1С (httpx), upsert в БД  │
 └────────────────────────────────────────────┘
 ```
 
@@ -30,8 +30,8 @@
 
 ## Открытые вопросы (решаем строго по одному)
 
-- [ ] **Q1.** Стек: Python 3.12 + FastAPI + SQLAlchemy 2.0 + PostgreSQL + APScheduler? *(предложено ниже)*
-- [ ] **Q2.** Типы токенов: статичные admin-токены (hash в БД) vs JWT для data-токенов?
+- [x] **Q1.** Стек: ✅ Python + uv + Flask + SQLAlchemy 2.0 + PostgreSQL/SQLite + APScheduler + httpx
+- [x] **Q2.** Токены: ✅ собственные opaque-токены (секрет в БД только как SHA-256 hash). Admin и data различаются полем `kind`; бессрочные + опц. срок; отзыв = `revoked_at`. Без JWT.
 - [ ] **Q3.** Хранение данных 1С: одна таблица JSONB на сущность vs EAV vs таблица на сущность?
 - [ ] **Q4.** Поддерживаемые параметры запроса: $filter/$count/$value — объём?
 - [ ] **Q5.** Удаления в 1С: soft-delete маркером vs удаление строк при расхождении?
