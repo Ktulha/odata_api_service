@@ -28,22 +28,34 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from odata_cache.db.base import Base
 from odata_cache.models.common import TimestampMixin
 
-# Имена таблиц данных/стейджа выводим из имени сущности: только ASCII-буквы,
-# цифры, подчёркивание; leading digit недопустим в SQL-идентификаторе.
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Имена таблиц данных выводим из имени сущности. 1С отдаёт EntitySet с
+# кириллицей («AccumulationRegister_ЗапасыПереданныеВРемонте»), поэтому
+# разрешаем Unicode-буквы: и PG, и SQLite принимают их в двойных кавычках
+# (SQLAlchemy идентификаторы котирует сам). Дефис/пробел — нельзя.
+_IDENT_RE = re.compile(r"^[^\W\d][\w]*$", re.UNICODE)
+
+
+def _assert_ident(ident: str, entity_name: str) -> str:
+    if not _IDENT_RE.match(ident):
+        raise ValueError(f"некорректное имя сущности для таблицы: {entity_name!r}")
+    if len(ident.encode("utf-8")) > 63:
+        # PostgreSQL молча обрезает идентификаторы до 63 байт — режем осознанно
+        # с детерминированным суффиксом по хэшу, чтобы имена не сталкивались.
+        import hashlib
+
+        digest = hashlib.sha1(ident.encode("utf-8")).hexdigest()[:8]
+        ident = ident.encode("utf-8")[:54].decode("utf-8", "ignore") + "_" + digest
+    return ident
 
 
 def storage_table_for(entity_name: str) -> str:
-    """«Боевая» таблица сущности: data_nomenclature."""
-    ident = entity_name.strip()
-    if not _IDENT_RE.match(ident):
-        raise ValueError(f"некорректное имя сущности для таблицы: {entity_name!r}")
-    return f"data_{ident.lower()}"
+    """«Боевая» таблица сущности: data_catalog_номенклатура."""
+    return _assert_ident(f"data_{entity_name.strip().lower()}", entity_name)
 
 
 def staging_table_for(entity_name: str) -> str:
-    """Временная таблица загрузки: stage_nomenclature (пересоздаётся каждую загрузку)."""
-    return f"stage_{entity_name.lower()}"
+    """Временная таблица загрузки: stage_... (пересоздаётся каждую загрузку)."""
+    return _assert_ident(f"stage_{entity_name.strip().lower()}", entity_name)
 
 
 class Entity(TimestampMixin, Base):
@@ -67,6 +79,10 @@ class Entity(TimestampMixin, Base):
 
     storage_table: Mapped[str] = mapped_column(String(128), nullable=False)
     staging_table: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # жизненный цикл кеширования (см. services/registry_service.STATE_*):
+    # discovered → nothing грузим; scheduled/on_demand → можно грузить; disabled → запрещено
+    state: Mapped[str] = mapped_column(String(16), default="discovered", nullable=False)
 
     # статистика последней успешной синхронизации (для админки/отладки)
     last_synced_at: Mapped[str | None] = mapped_column(Text)
