@@ -15,6 +15,7 @@ from odata_cache.models.common import TimestampMixin, UTCText, utcnow_iso
 from odata_cache.models.metadata import MetadataSnapshot, ODataMetadata
 from odata_cache.models.registry import (
     Entity,
+    EntityAlias,
     EntityProperty,
     staging_table_for,
     storage_table_for,
@@ -24,6 +25,7 @@ from odata_cache.models.sync import RequestLog, SyncJob, SyncRun
 __all__ = [
     "ApiToken",
     "Entity",
+    "EntityAlias",
     "EntityProperty",
     "MetadataSnapshot",
     "ODataMetadata",

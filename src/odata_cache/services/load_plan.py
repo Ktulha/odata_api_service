@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from odata_cache.models.registry import Entity
 from odata_cache.services.access import get_entity, is_globally_allowed
+from odata_cache.services.entity_resolution import resolve_ref_target
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ class LoadTask:
     #                                     или «ключи придут после загрузки родителя»
     pending_keys: bool = False      # True ⇒ ждём distinct *_Key из строк родителя
     via: str = ""                   # как узнали о задаче: schedule|on_demand|ref:<имя>
+    # реальная сущность для чтения/expand, если исходная — прокладка (alias):
+    reads_for: list[str] = field(default_factory=list)
 
     def filter_expression(self, key_property: str) -> str | None:
         """OData $filter для выборки только нужных ключей (для on-demand докачки)."""
@@ -98,6 +101,7 @@ def build_load_plan(
         raise ValueError(f"сущность {root_name!r} не найдена в реестре")
 
     visited: set[int] = {root.id}
+    tasks_by_target: dict[int, LoadTask] = {}
     queue: list[tuple[Entity, list[str] | None, str, int]] = [(root, None, "", 0)]
 
     while queue:
@@ -106,32 +110,44 @@ def build_load_plan(
             task_keys = None if mode == "full" else keys
         else:
             task_keys = keys
-        plan.tasks.append(
-            LoadTask(
-                entity_name=ent.name,
-                root=ent is root,
-                key_values=task_keys,
-                # зависимость без готового списка ключей: worker подставит их
-                # после загрузки родителя (distinct ненулевых *_Key)
-                pending_keys=(ent is not root and task_keys is None),
-                via=via,
-            )
+        task = LoadTask(
+            entity_name=ent.name,
+            root=ent is root,
+            key_values=task_keys,
+            # зависимость без готового списка ключей: worker подставит их
+            # после загрузки родителя (distinct ненулевых *_Key)
+            pending_keys=(ent is not root and task_keys is None),
+            via=via,
         )
+        plan.tasks.append(task)
+        tasks_by_target[ent.id] = task
 
         if depth >= max_depth:
             logger.debug("каскад обрезан по глубине: %s", ent.name)
             continue
 
-        # цели ссылок этой сущности: из реестра (FK) + данные не нужны — схема уже в property
+        # цели ссылок этой сущности: из реестра (FK) + подмены (alias/link_override)
         targets: dict[int, str] = {}
         for prop in ent.properties:
             if prop.ref_kind == "collection":
                 continue  # дочерние таблицы грузятся отдельным механизмом (RecordSet)
-            target_id = prop.ref_entity_id
-            if target_id is None:
+            source_id = prop.ref_entity_id
+            if source_id is None:
                 # нет FK в реестре: если свойство выглядит как *_Key Guid — цель неизвестна,
                 # проверим по данным на шаге загрузки (_Type-эвристика в loader'е)
                 continue
+            resolved = resolve_ref_target(session, ent, prop, source_id)
+            if resolved is None:
+                continue
+            target_id = resolved.effective_id
+            if resolved.changed:
+                # прокладка: данные лежат в target, но ссылки клиентов формально
+                # указывают на source → помечаем, для каких сущностей читается target
+                t = tasks_by_target.get(target_id)
+                src_name = session.get(Entity, resolved.source_id)
+                if t is not None and src_name is not None:
+                    if src_name.name not in t.reads_for:
+                        t.reads_for.append(src_name.name)
             targets[target_id] = prop.name
 
         for target_id, via_prop in targets.items():

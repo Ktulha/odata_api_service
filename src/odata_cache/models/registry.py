@@ -84,6 +84,17 @@ class Entity(TimestampMixin, Base):
     # discovered → nothing грузим; scheduled/on_demand → можно грузить; disabled → запрещено
     state: Mapped[str] = mapped_column(String(16), default="discovered", nullable=False)
 
+    # --- подмена «пустых» таблиц-прокладок (решение «а+б») ------------------
+    # 1С иногда отдаёт пустой Catalog_ЕдиницыИзмерения, а реальные наименования
+    # живут в Catalog_КлассификаторЕдиницИзмерения. alias_of указывает, ЧЬИ данные
+    # лежат в этой таблице (или куда перенаправлять запрос, если своя таблица пуста).
+    # link_override — JSON-карта точечных подмен целей ссылок:
+    #   {"ЕдиницаИзмерения_Key": "Catalog_КлассификаторЕдиницИзмерения"}
+    alias_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("entities.id", ondelete="SET NULL")
+    )
+    link_override: Mapped[str | None] = mapped_column(Text)  # JSON: prop_name → entity name
+
     # статистика последней успешной синхронизации (для админки/отладки)
     last_synced_at: Mapped[str | None] = mapped_column(Text)
     last_sync_count: Mapped[int | None] = mapped_column(Integer)
@@ -100,6 +111,73 @@ class Entity(TimestampMixin, Base):
 
     def __repr__(self) -> str:  # pragma: no cover - отладочный хелпер
         return f"<Entity {self.name} active={self.is_active}>"
+
+    @property
+    def link_override_map(self) -> dict[str, str]:
+        """Распарсенная ``link_override`` (пустой словарь, если не задана)."""
+        import json
+
+        if not self.link_override:
+            return {}
+        try:
+            data = json.loads(self.link_override)
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+class EntityAlias(Base):
+    """Подмена цели ссылки / «пустой» таблицы-прокладки (решение «а+б»).
+
+    Две ситуации, которые она закрывает:
+
+    1. **Прокладка**: ``Catalog_ЕдиницыИзмерения`` существует в OData, но пустая —
+       реальные наименования единиц лежат в ``Catalog_КлассификаторЕдиницИзмерения``.
+       Пишем строку: ``entity`` = прокладка, ``target`` = настоящая таблица.
+    2. **Точечная подмена цели у конкретной сущности**: ссылка ``Организация_Key``
+       в регистре ведёт на ``Catalog_Организации``, а данные надо брать из другой
+       сущности — задаём ``owner`` (сущность-владелец свойства) и ``property_name``.
+
+    Приоритет разрешения (см. services/entity_resolution.py):
+    точечная (owner+property) → общая для сущности (owner) → глобальная (прокладка).
+    Запрещённая цель-подмена НЕ применяется: остаётся исходная логика «запрещено →
+    не грузим и в вывод не отдаём».
+    """
+
+    __tablename__ = "entity_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "property_name", "entity_id", name="uq_entity_alias"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # владелец правила: конкретная сущность (её ссылки переопределяются);
+    # NULL → правило глобальное (для всех сущностей, ссылающихся на entity_id)
+    owner_id: Mapped[int | None] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE")
+    )
+    # имя свойства ссылки ("ЕдиницаИзмерения_Key"); NULL → любое свойство,
+    # ведущее на entity_id (то есть сам entity_id treated as прокладка)
+    property_name: Mapped[str | None] = mapped_column(String(128))
+    # «исходная» сущность — та, на которую формально указывает ссылка/таблица
+    entity_id: Mapped[int] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
+    )
+    # куда перенаправляем загрузку/чтение
+    target_id: Mapped[int] = mapped_column(
+        ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    entity: Mapped[Entity] = relationship(foreign_keys=[entity_id])
+    target: Mapped[Entity] = relationship(foreign_keys=[target_id])
+    owner: Mapped[Entity | None] = relationship(foreign_keys=[owner_id])
+
+    def __repr__(self) -> str:  # pragma: no cover
+        scope = f"{self.owner_id}/{self.property_name}" if self.owner_id else "global"
+        return f"<EntityAlias {scope}: {self.entity_id} -> {self.target_id}>"
 
 
 class EntityProperty(Base):

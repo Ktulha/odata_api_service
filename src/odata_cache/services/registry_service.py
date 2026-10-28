@@ -39,6 +39,22 @@ from odata_cache.models.registry import (
 
 logger = logging.getLogger(__name__)
 
+# Префиксы имён EntitySet в 1С (области метаданных). Нужны для эвристики целей
+# ссылок: свойство ``Склад_Key`` → EntitySet ``Catalog_Склады`` и т.п.
+_SET_PREFIXES = (
+    "Catalog_",
+    "Document_",
+    "ChartOfAccounts_",
+    "ChartOfCharacteristicTypes_",
+    "ChartOfCalculationTypes_",
+    "InformationRegister_",
+    "AccumulationRegister_",
+    "CalculationRegister_",
+    "BusinessProcess_",
+    "Task_",
+    "Enum_",
+)
+
 # --- состояния жизненного цикла кеширования ---
 STATE_DISCOVERED = "discovered"   # найдена в $metadata, ничего не грузим
 STATE_SCHEDULED = "scheduled"     # добавлена админом в расписание
@@ -130,50 +146,24 @@ def sync_metadata_to_registry(session: Session, model: MetadataModel) -> SyncRes
             created.append(set_name)
             continue
 
-        # ref_target из плана нормализуем к имени сущности реестра — иначе
-        # сравнение отпечатков «прыгает» между проходами разбора.
-        type_to_entity_name: dict[str, str] = {}
-        for e in session.scalars(select(Entity)):
-            short = (e.odata_type_name or "").rsplit(".", 1)[-1]
-            if short:
-                type_to_entity_name.setdefault(short, e.name)
-            type_to_entity_name.setdefault(e.name, e.name)
-        norm_plan = [
-            row[:10] + (type_to_entity_name.get(row[10], row[10]) if row[10] else None,) + row[11:]
-            for row in plan
-        ]
-        new_fp = _fingerprint(norm_plan)
-        # ref_target в плане — имя EntityType из metadata; сравниваем с целевой
-        # сущностью реестра (ref_entity_id), иначе каждый проход «видел» бы
-        # изменение схемы и гнал schema_version вверх.
-        by_id = {e.id: e for e in session.scalars(select(Entity))}
-
-        def _ref_of(p) -> str:
-            """Нормализованная цель ссылки для отпечатка: короткое ИМЯ ТИПА цели.
-
-            В плане цель записана как имя типа, в ORM — как ref_entity_id;
-            приводим оба к одному виду (short type name), а незакрытую ссылку
-            — к стабильному '~<имя свойства>', чтобы не «мерцала».
-            """
-            if not p.ref_kind:
-                return ""
-            ent = by_id.get(p.ref_entity_id) if p.ref_entity_id else None
-            if ent is None:
-                return f"~{p.name}"
-            return (ent.odata_type_name or "").rsplit(".", 1)[-1] or ent.name
-
-        old_fp = _fingerprint(
+        # Сравнение схемы — по нормализованным колонкам (см. _norm_columns):
+        # план из $metadata и набор EntityProperty из БД приводятся к одному
+        # виду, поэтому повторный разбор идемпотентен.
+        known_types = set(model.entity_types)
+        new_cols = _norm_columns(_plan_columns(info, known_types))
+        old_cols = _norm_columns(
             [
                 (
-                    p.name, p.column_name, p.edm_type, p.value_type,
-                    _ref_of(p),
+                    p.name, p.column_name, p.edm_type, p.nullable,
+                    p.is_key, bool(p.ref_kind), p.ref_entity_id,
                 )
-                for p in sorted(entity.properties, key=lambda x: x.position)
-            ]
+                for p in entity.properties
+            ],
+            id_to_type=_id_to_short_type(session),
         )
-        if new_fp != old_fp:
+        if new_cols != old_cols:
             entity.schema_version += 1
-            _replace_properties(session, entity, norm_plan)
+            _replace_properties(session, entity, plan)
             updated.append(set_name)
         else:
             unchanged.append(set_name)
@@ -285,19 +275,34 @@ def _resolve_ref_targets(
     1С) — тогда ссылка остаётся «висячей» без FK: в БД это будет просто Guid-колонка,
     а в API поле не раскрывается через expand. Так работает правило 3.
     """
-    props_by_name = {p.name: p for p in entity.properties}
     by_id = {e.id: e for e in session.scalars(select(Entity))}
 
     def _short_type_name(e: Entity) -> str:
         return (e.odata_type_name or "").rsplit(".", 1)[-1] or e.name
 
+    def _set_ref(prop_name: str, target_id: int | None) -> None:
+        """Проставить FK цели ссылки.
+
+        Свойства пересоздаются пачкой, поэтому ищем их НЕ по объектам в памяти
+        (их порядок/идентичность после cascade-флешей ненадёжна), а по данным —
+        через SELECT: он принудительно flush'ит сессию и возвращает актуальные
+        строки EntityProperty этой сущности.
+        """
+        if target_id is None:
+            return
+        row = session.scalar(
+            select(EntityProperty).where(
+                EntityProperty.entity_id == entity.id,
+                EntityProperty.name == prop_name,
+            )
+        )
+        if row is not None and row.ref_kind:
+            row.ref_entity_id = target_id
+
     # 1) по плану (Association из $metadata): цель — короткое имя EntityType
     for row in plan:
         ref_target = row[10]
         if not ref_target:
-            continue
-        ep = props_by_name.get(row[0])
-        if ep is None:
             continue
         target = next(
             (e for e in by_id.values() if _short_type_name(e) == ref_target), None
@@ -306,7 +311,7 @@ def _resolve_ref_targets(
             session.scalar(select(Entity).where(Entity.name == target)) if target else None
         )
         if t is not None and t.id != entity.id:
-            ep.ref_entity_id = t.id
+            _set_ref(row[0], t.id)
 
     # 2) доводка эвристикой по имени свойства (Номенклатура_Key → Catalog_Номенклатура),
     #    когда цель не разрешилась через Association (1С иногда их не объявляет)
@@ -314,7 +319,10 @@ def _resolve_ref_targets(
     for e in by_id.values():
         type_to_ent.setdefault(_short_type_name(e), e)
         type_to_ent.setdefault(e.name, e)
-    for ep in entity.properties:
+    fresh_props = session.scalars(
+        select(EntityProperty).where(EntityProperty.entity_id == entity.id)
+    ).all()
+    for ep in fresh_props:
         if ep.ref_kind and ep.ref_entity_id is None:
             hit = _find_ref_target(session, entity, ep, type_to_ent)
             if hit is not None:
@@ -336,22 +344,53 @@ def _guess_set_by_suffix(session: Session, type_name: str) -> str | None:
     return None
 
 
-def _fingerprint(rows: list[tuple]) -> tuple:
-    """Отпечаток схемы сущности для сравнения «изменилось ли что-то».
+# Кортеж «колонка» для сравнения схем:
+# (name, column_name, edm_type, nullable, is_key, ref_kind, target_key)
+# Позицию НЕ учитываем: она присваивается только колонкам-скалярам, а нумерация
+# в $metadata идёт по всем свойствам (навигации/коллекции тоже занимают номер).
+_COL_FIELDS = 7
 
-    Учитываем только то, на что реагирует DDL: имя колонки, её SQL-имя, тип,
-    nullability и ссылка (вид + цель). Позиция — тоже часть отпечатка: перестановка
-    полей в 1С меняет порядок колонок в выгрузке.
+
+def _plan_columns(info: EntityTypeInfo, known_types: set[str]) -> list[tuple]:
+    """План колонок из $metadata в компактном виде для сравнения."""
+    keys = set(info.keys)
+    cols: list[tuple] = []
+    for name, prop in info.properties.items():
+        if prop.is_navigation or prop.is_collection:
+            continue
+        target = prop.ref_target if prop.ref_target in known_types else None
+        cols.append(
+            (name, name, prop.type_name, bool(prop.nullable),
+             name in keys, bool(target), target or "")
+        )
+    return cols
+
+
+def _norm_columns(rows: list[tuple], id_to_type: dict[int, str] | None = None) -> tuple:
+    """Привести колонки к сопоставимому виду.
+
+    Цель ссылки в плане из $metadata — короткое имя EntityType, а в БД —
+    ``ref_entity_id``; приводим id к тому же короткому имени, поэтому повторный
+    разбор идемпотентен. Незакрытая ссылка (цели нет в реестре) сравнивается как
+    пустая строка с обеих сторон.
     """
     norm: list[tuple] = []
     for row in rows:
-        if len(row) >= 12:      # план из _plan_properties
-            name, column, edm, vtype, nullable, _ml, _pr, _sc, is_key, ref_kind, ref_target, pos = row[:12]
-            norm.append((name, column, edm, vtype, bool(nullable), bool(is_key), ref_kind or "", ref_target or "", pos))
-        else:                   # кортеж из ORM-свойств (5 полей)
-            name, column, edm, vtype, ref = row[:5]
-            norm.append((name, column, edm, vtype, True, False, "", ref or "", len(norm)))
-    return tuple(norm)
+        name, column, edm, nullable, is_key, has_ref, target = row[:_COL_FIELDS]
+        if isinstance(target, int):                     # ref_entity_id из ORM
+            target = (id_to_type or {}).get(target, "")
+        norm.append((name, column, edm, bool(nullable), bool(is_key),
+                     bool(has_ref), target or ""))
+    return tuple(sorted(norm))
+
+
+def _id_to_short_type(session: Session) -> dict[int, str]:
+    """id сущности реестра → короткое имя EntityType (для нормализации целей)."""
+    out: dict[int, str] = {}
+    for e in session.scalars(select(Entity)):
+        short = (e.odata_type_name or "").rsplit(".", 1)[-1]
+        out[e.id] = short or e.name
+    return out
 
 
 def resolve_all_ref_targets(session: Session) -> int:
@@ -385,24 +424,94 @@ def resolve_all_ref_targets(session: Session) -> int:
     return fixed
 
 
+_REF_SUFFIXES = ("_Ref_Key", "_Key", "Key")
+
+
+def ref_property_base(prop_name: str) -> str:
+    """Имя свойства ссылки без ключевого суффикса: ``Склад_Key`` → ``Склад``."""
+    base = prop_name
+    for suffix in _REF_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base
+
+
 def _find_ref_target(
     session: Session,
     owner: Entity,
     prop: EntityProperty,
     type_to_entity: dict[str, Entity],
 ) -> Entity | None:
-    """Цель ссылки: сначала по имени свойства (``Номенклатура_Key`` → Нomenклатура),
-    затем по суффиксу имени типа."""
-    base = prop.name
-    for suffix in ("_Ref_Key", "_Key", "Key"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-            break
-    for cand in (base, f"Catalog_{base}", f"ChartOfCharacteristicTypes_{base}"):
+    """Цель ссылки: сначала по имени свойства (``Номенклатура_Key`` → Номенклатура),
+    затем по суффиксу имени типа.
+
+    Имена EntitySet в 1С всегда с префиксом области (``Catalog_``, ``Document_``,
+    ``AccumulationRegister_`` …), поэтому «голое» имя (``Склад``) почти никогда не
+    совпадает — его тоже проверяем через перебор префиксов.
+    """
+    base = ref_property_base(prop.name)
+    candidates = [base] + [f"{prefix}{base}" for prefix in _SET_PREFIXES]
+    for cand in candidates:
         hit = type_to_entity.get(cand)
         if hit is not None and hit.id != owner.id:
             return hit
+    # морфология 1С: свойство «Склад_Key» → каталог «Catalog_Склады»,
+    # «ЕдиницаИзмерения_Key» → «Catalog_ЕдиницыИзмерения». Ищем по началу слова,
+    # сравнение — с окончанием целевого имени (род. падеж мн. ч. в 1С).
+    low = base.lower()
+    best: tuple[int, Entity] | None = None
+    for name, hit in type_to_entity.items():
+        if hit.id == owner.id:
+            continue
+        other_low = _strip_set_prefix(name).lower()
+        if not _prefix_match(low, other_low):
+            continue
+        score = len(other_low)  # берём ближайшее по длине совпадение
+        if best is None or score < best[0]:
+            best = (score, hit)
+    if best is not None:
+        return best[1]
+    # последний шанс: цель спрятана в суффиксе длинного имени (…_Организация)
+    for name, hit in type_to_entity.items():
+        if hit.id != owner.id and (name.endswith(f"_{base}") or name == base):
+            return hit
     return None
+
+
+def _prefix_match(a: str, b: str) -> bool:
+    """Морфологическое «похоже»: совпадает префикс без учёта чередующихся гласных.
+
+    1С любит формы типа «ЕдиницаИзмерения» (свойство) vs «ЕдиницыИзмерения»
+    (каталог): общие первые символы прерываются на «а/ы», поэтому считаем
+    совпадение по согласным — их последовательность в таких парах одинакова.
+    """
+    if a == b:
+        return True
+    common = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        common += 1
+    if common >= max(4, min(len(a), len(b)) - 2):
+        return True
+    # сравнение по согласным (беглые/чередующиеся гласные а/о/е/ы/и игнорируем)
+    cons_a = [c for c in a if c not in "аеоыяиюёу"]
+    cons_b = [c for c in b if c not in "аеоыяиюёу"]
+    cc = 0
+    for ca, cb in zip(cons_a, cons_b):
+        if ca != cb:
+            break
+        cc += 1
+    return cc >= max(5, min(len(cons_a), len(cons_b)) - 1)
+
+
+def _strip_set_prefix(name: str) -> str:
+    """``Catalog_Склады`` → ``Склады``; имя без известного префикса — как есть."""
+    for prefix in _SET_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
 
 
 def _pick_title(info: EntityTypeInfo) -> str | None:
