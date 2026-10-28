@@ -185,22 +185,67 @@ def _strip_set_prefix(name: str) -> str:
 def _candidates_by_suffix(base: str, entities: list[Entity]) -> list[tuple[Entity, float, str]]:
     """Похожие имена: суффиксное совпадение («ЕдиницыИзмерения» ⊂ «КлассификаторЕдиницИзмерения»).
 
-    Балл: 0.9 — имя кандидата заканчивается на базовое имя; 0.7 — базовое имя
-    встречается внутри; 0.5 — совпадает предок слова (например единичн/единиц).
+    Балл: 0.9 — имя кандидата заканчивается на базовое имя; 0.75 — основа
+    кандидата (после усечения падежного окончания) заканчивается на основу
+    базы — так ловится род. падеж мн. ч. в классификаторах 1С
+    («единицы/единиц», «склады/складов»); 0.7 — база входит в имя целиком;
+    0.5 — просто общий префикс.
     """
     out: list[tuple[Entity, float, str]] = []
     low = base.lower()
+    stem = _truncate_case(low)
     for e in entities:
-        other = _strip_set_prefix(e.name).lower()
-        if other == low:
+        other_full = _strip_set_prefix(e.name).lower()
+        if other_full == low:
             continue
-        if other.endswith(low):
+        if other_full.endswith(low):
             out.append((e, 0.9, f"имя '{e.name}' оканчивается на '{base}'"))
-        elif low in other:
+            continue
+        # сравнение по основе: у обоих имён отрезаем окончание последнего слова
+        # (измерения/измерений) — оно меняется в разных сущностях чаще всего.
+        # Гласные «и/е» в чередующихся основах (единиц/единицы) не учитываем.
+        other_stem = _truncate_case(other_full)
+        if len(stem) >= 6 and _ends_with_stem(other_stem, stem):
+            out.append((e, 0.75, f"основа '{stem}' совпадает с окончанием '{e.name}'"))
+        elif low in other_full:
             out.append((e, 0.7, f"'{base}' входит в имя '{e.name}'"))
-        elif _common_stem(low, other) >= 5:
+        elif _common_stem(low, other_full) >= 5:
             out.append((e, 0.5, f"общий корень со '{e.name}'"))
     return out
+
+
+def _ends_with_stem(whole: str, stem: str) -> bool:
+    """Оканчивается ли ``whole`` на ``stem`` с нестрогим совпадением гласных.
+
+    Сравнение идем СПРАВА (суффикс важнее): окончание слова в 1С меняется
+    («единицы»/«единиц»), поэтому ищем максимальный общий суффикс и считаем
+    совпадение по согласным — гласные пропускаем, чередующиеся «ы/и/е» тоже.
+    Если длина совпавшей части >= len(stem) - 2 — считаем, что основа та же.
+    """
+    if whole.endswith(stem):
+        return True
+    # сравним справа: последние N символов должны совпасть по согласным
+    def consonants(s: str) -> list[str]:
+        return [c for c in s if c not in "аеоыяиюёуэьъ"]
+    ws, ss = consonants(whole[-len(stem) - 3:]), consonants(stem)
+    if len(ss) < 4 or len(ws) < len(ss):
+        return False
+    tail = ws[-len(ss):]
+    return all(a == b for a, b in zip(tail, ss))
+
+
+def _truncate_case(name: str) -> str:
+    """Усечь падежное окончание последнего слова: «…измерения» → «…измерен».
+
+    Грубая замена лемматизации: режем хвост из <гласная><согласная+> после
+    последней гласной не ближе 3 символов к концу — для имён 1С этого хватает,
+    чтобы «единицыизмерения» и «единицизмерения» дали общую основу.
+    """
+    trimmed = name.rstrip("аеоыяиюёуь")
+    for i in range(len(trimmed) - 1, max(len(trimmed) - 4, 1), -1):
+        if trimmed[i] in "аеоыяиюёу":
+            return trimmed[:i]
+    return trimmed
 
 
 def _common_stem(a: str, b: str) -> int:
