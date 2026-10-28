@@ -71,7 +71,10 @@ _TOKEN_RE = re.compile(
     r"""
     (?P<ws>\s+)
   | (?P<tstring>(?:guid|datetime|date)\s*'[^']*')   # типизированный литерал
+  | (?P<guidlit>guid\s*\((?:'[^']*'|"[^"]*"|[A-Za-z0-9_-]+)\))  # канон OData v3: guid(...)
   | (?P<string>'(?:[^']|'')*')                      # обычная строка
+  | (?P<unq>[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*(?:-[A-Za-zА-Яа-яЁё_0-9]+)+)
+                                                    # некавыцированное имя поля с дефисом
   | (?P<number>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
   | (?P<op><>|!=|>=|<=|[=<>~])
   | (?P<lparen>[\(\[\{])
@@ -119,10 +122,15 @@ def tokenize(source: str, end_pos: int | None = None) -> list[Token]:
             prefix = text[:prefix_len].strip().lower()
             raw = text[prefix_len + 1:-1]
             tokens.append(Token("string", raw, pos, literal=prefix))
+        elif kind == "guidlit":
+            inner = text[text.index("(") + 1:-1].strip().strip("'\"")
+            tokens.append(Token("string", inner, pos, literal="guid"))
         elif kind == "string":
             tokens.append(Token("string", text[1:-1].replace("''", "'"), pos))
         elif kind == "number":
             tokens.append(Token("number", text, pos))
+        elif kind == "unq":
+            tokens.append(Token("ident", text, pos))
         elif kind == "word":
             low = text.lower()
             if low in RESERVED_WORDS:
