@@ -29,7 +29,7 @@ from odata_cache.services import access, ddl
 from odata_cache.services.registry_service import STATE_SCHEDULED
 from odata_cache.worker import loader
 
-from tests.test_real_sample import SAMPLE_META
+from test_real_sample import SAMPLE_META
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "Catalog_Номенклатура.json"
 
