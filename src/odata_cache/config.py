@@ -27,6 +27,10 @@ class Settings(BaseSettings):
 
     # --- база данных кеша (PostgreSQL или SQLite) ---
     database_url: str = "sqlite:///./odata_cache.db"
+    sql_echo: bool = False          # логировать SQL (отладка)
+    db_pool_size: int = 5           # только для PostgreSQL-URL
+    db_max_overflow: int = 10
+    db_pool_recycle: int = 1800
 
     # --- 1С OData (использует ТОЛЬКО worker) ---
     onedata_base_url: str = ""      # напр. https://host/OData/Publish.svc
